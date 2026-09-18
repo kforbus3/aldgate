@@ -1,5 +1,7 @@
 {
-  "index_patterns": ["snmp-*"],
+  "index_patterns": [
+    "snmp-*"
+  ],
   "priority": 100,
   "template": {
     "settings": {
@@ -11,20 +13,75 @@
     "mappings": {
       "dynamic": true,
       "properties": {
-        "@timestamp": { "type": "date" },
-        "timestamp":  { "type": "date" },
-        "host":       { "type": "keyword" },
-        "source":     { "type": "keyword" },
-        "log_type":   { "type": "keyword" },
-        "name":       { "type": "keyword" },
-        "oid":        { "type": "keyword" },
-        "mib":        { "type": "keyword" },
-        "version":    { "type": "keyword" },
-        "community":  { "type": "keyword" }
+        "@timestamp": {
+          "type": "date"
+        },
+        "timestamp": {
+          "type": "date"
+        },
+        "received_at": {
+          "type": "date"
+        },
+        "host": {
+          "type": "keyword"
+        },
+        "host_short": {
+          "type": "keyword"
+        },
+        "program": {
+          "type": "keyword"
+        },
+        "severity": {
+          "type": "keyword"
+        },
+        "severity_code": {
+          "type": "byte"
+        },
+        "facility": {
+          "type": "keyword"
+        },
+        "message": {
+          "type": "text"
+        },
+        "log_type": {
+          "type": "keyword"
+        },
+        "observer": {
+          "type": "keyword"
+        },
+        "source_address": {
+          "type": "ip"
+        },
+        "oid": {
+          "type": "keyword"
+        },
+        "mib": {
+          "type": "keyword"
+        },
+        "snmp_version": {
+          "type": "keyword"
+        },
+        "snmp_vars": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "keyword"
+            },
+            "index": {
+              "type": "keyword"
+            },
+            "value": {
+              "type": "keyword"
+            }
+          }
+        },
+        "parse_error": {
+          "type": "keyword"
+        }
       }
     }
   },
   "_meta": {
-    "why": "Trap variables are unpredictable, so dynamic mapping stays on; only the fields you filter by are pinned. oid and mib are keyword so a trap type can be filtered exactly."
+    "why": "Deliberately the SAME field names and types as syslog-*, so one query covers both indices and one filter means the same thing in each. snmp_vars is a LIST of name/index/value with a FIXED shape: a real trap names variables ifIndex.2, and a dot is a path in OpenSearch, so an object keyed by varbind name collides with itself (snmp_vars.ifIndex.2 vs snmp_vars.ifIndex) and the whole document is rejected with a 400. A fixed shape also stops the mapping growing one field per port per device."
   }
 }

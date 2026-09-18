@@ -44,7 +44,171 @@ sources:
     mode: tcp
     timezone: ${ALDGATE_TIMEZONE}
 
+  # SNMP traps, handed over by Telegraf.
+  #
+  # Vector cannot speak SNMP and Telegraf cannot produce these field names --
+  # its OpenSearch output nests everything under the measurement name, so a trap
+  # arrives as snmp_trap.ifIndex and tag.source while a syslog line is host and
+  # message. That is two schemas sharing a UI, and it means a person filtering
+  # by host sees half their network. So Telegraf receives the trap and posts it
+  # straight here, and normalisation happens exactly once, in one language, for
+  # everything that arrives.
+  snmp_traps:
+    type: http_server
+    address: 0.0.0.0:8180
+    # decoding.codec, NOT `encoding`. `encoding: json` is accepted here without
+    # complaint and does nothing -- the body then arrives as a JSON *string* in
+    # .message, which the transform below overwrites, so every trap indexed as a
+    # complete document with every field empty. Nothing errored anywhere.
+    decoding:
+      codec: json
+    path: /telegraf
+
 transforms:
+  normalise_snmp:
+    type: remap
+    inputs: [snmp_traps]
+    drop_on_error: false
+    drop_on_abort: false
+    source: |
+      # Telegraf posts one metric per request (use_batch_format = false), so the
+      # payload IS the metric. If a {"metrics":[...]} envelope ever shows up --
+      # someone turned batching back on -- say so in the document instead of
+      # trying to be clever. The first version of this guessed, failed, and fell
+      # back to an empty object: OpenSearch then held a perfectly well-formed
+      # trap with every field blank, which is indistinguishable from a trap that
+      # genuinely carried nothing. A loud wrong document beats a quiet one.
+      # Belt and braces for the failure above: if the body ever arrives as an
+      # unparsed string again, parse it here rather than writing an empty
+      # document. And if it cannot be parsed, keep it and say so -- an ugly
+      # document you can read is worth more than a tidy one that lost the event.
+      if !exists(.tags) && is_string(.message) {
+        parsed = parse_json(.message) ?? null
+        if is_object(parsed) {
+          . = object!(parsed)
+        } else {
+          .parse_error = "SNMP payload was not JSON"
+        }
+      }
+      if exists(.metrics) {
+        .parse_error = "batched payload; set use_batch_format = false in telegraf.conf"
+        .raw = encode_json(.metrics)
+      }
+
+      .observer = "aldgate"
+      .log_type = "snmp_trap"
+
+      tags = object(.tags) ?? {}
+      vars = object(.fields) ?? {}
+
+      # --- host -----------------------------------------------------------
+      # A trap identifies its sender by IP, which is not what anyone wants to
+      # filter by. ALDGATE_DEVICE_MAP turns the ones you care about into names,
+      # so `coreswitch` means the same thing here as it does in syslog. An
+      # unmapped device keeps its IP rather than being dropped or called
+      # "unknown" -- an address you can look up beats a placeholder.
+      src = to_string(get(tags, ["source"]) ?? "") ?? ""
+      names = parse_key_value("${ALDGATE_DEVICE_MAP}",
+                key_value_delimiter: "=", field_delimiter: ",") ?? {}
+      mapped = to_string(get(names, [src]) ?? "") ?? ""
+      if mapped != "" {
+        .host = downcase(mapped)
+      } else if src != "" {
+        .host = src
+      } else {
+        .host = "unknown"
+      }
+      # An unmapped device is an IP, and an IP's dots are not a domain.
+      if match(.host, r'^\d+\.\d+\.\d+\.\d+$') {
+        .host_short = .host
+      } else {
+        .host_short = replace(.host, r'\..*$', "")
+      }
+      if src != "" { .source_address = src }
+
+      # --- program --------------------------------------------------------
+      # The trap's name is the closest thing it has to "what generated this",
+      # which is the question `program` answers for syslog.
+      tn = to_string(get(tags, ["name"]) ?? "") ?? ""
+      if tn == "" { tn = "snmp_trap" }
+      .program = tn
+      .oid = to_string(get(tags, ["oid"]) ?? "") ?? ""
+      .mib = to_string(get(tags, ["mib"]) ?? "") ?? ""
+      .snmp_version = to_string(get(tags, ["version"]) ?? "") ?? ""
+
+      # --- severity -------------------------------------------------------
+      # SNMP has no severity field at all: a link dropping and a device booting
+      # arrive looking identical. Without this, "errors in the last hour" cannot
+      # include the network, which is where errors are most often visible first.
+      # Only the standard traps are classified; anything unrecognised is notice,
+      # never silently important and never silently ignorable.
+      by_name = {
+        "linkdown": "error", "authenticationfailure": "warning",
+        "coldstart": "warning", "warmstart": "notice", "linkup": "notice",
+        "risingalarm": "warning", "fallingalarm": "notice"
+      }
+      sev = to_string(get(by_name, [downcase(.program)]) ?? "") ?? ""
+      if sev == "" { sev = "notice" }
+      .severity = sev
+      ranks = {
+        "emerg": 0, "alert": 1, "crit": 2, "error": 3,
+        "warning": 4, "notice": 5, "info": 6, "debug": 7
+      }
+      sc = get(ranks, [.severity]) ?? 5
+      if sc == null { sc = 5 }
+      .severity_code = sc
+      .facility = "snmp"
+
+      # --- message --------------------------------------------------------
+      # The varbinds ARE the content of a trap, and a document whose message is
+      # "linkDown" tells you nothing about which link. Rendered as key=value on
+      # one line so the message column reads like a log line, while the same
+      # values stay individually searchable under snmp_vars.
+      rendered = encode_key_value(vars)
+      if rendered != "" {
+        .message = .program + ": " + rendered
+      } else {
+        .message = .program
+      }
+
+      # The varbinds are stored as a LIST of name/index/value, not as an object
+      # keyed by the varbind name, and that is not a style choice.
+      #
+      # A real trap names its variables with the instance appended after a dot:
+      # ifIndex.2, ifOperStatus.2. A dot in a JSON key is a path in OpenSearch,
+      # so snmp_vars.ifIndex.2 collides with the existing snmp_vars.ifIndex
+      # (a long, from an earlier trap) and the WHOLE DOCUMENT is rejected with
+      # 400 mapper_parsing_exception. Vector treats that as non-retriable and
+      # drops it. Every hand-written test trap indexed perfectly; the first one
+      # from an actual switch vanished, and nothing in Telegraf or OpenSearch
+      # said so out loud -- only Vector's sink log, which nobody reads.
+      #
+      # A fixed shape also caps the mapping: one field per PORT per device
+      # (ifIndex_2, ifIndex_5, ...) would otherwise grow the index mapping
+      # without limit as the network grows.
+      entries = []
+      for_each(vars) -> |k, v| {
+        key = to_string(k)
+        parts = split(key, ".", limit: 2)
+        nm = to_string(get(parts, [0]) ?? key) ?? key
+        ix = to_string(get(parts, [1]) ?? "") ?? ""
+        entries = push(entries, {"name": nm, "index": ix, "value": to_string(v) ?? ""})
+      }
+      if length(entries) > 0 { .snmp_vars = entries }
+
+      # --- time -----------------------------------------------------------
+      .received_at = now()
+      ts = to_int(get(., ["timestamp"]) ?? 0) ?? 0
+      if ts > 0 {
+        .timestamp = from_unix_timestamp!(ts)
+      } else {
+        .timestamp = .received_at
+      }
+
+      del(.tags)
+      del(.fields)
+      del(.name)
+
   normalise:
     type: remap
     inputs: [syslog_udp, syslog_tcp, syslog_tls]
@@ -68,8 +232,30 @@ transforms:
       hs = to_string(h) ?? "unknown"
       if hs == "" { hs = "unknown" }
       .host = downcase(hs)
-      # Strip the domain so `web01` and `web01.example.com` group together.
-      .host_short = replace(.host, r'\..*$', "")
+
+      # What YOU call the device wins over what it calls itself. The core switch
+      # announces itself as "mikrotik" -- the factory identity -- so its logs
+      # arrived under a name that matches neither its DNS name nor the name on
+      # its SNMP traps, and searching for `coreswitch` found nothing while the
+      # switch was sending perfectly well. Same map as the trap pipeline, keyed
+      # on the sending address, so one device is one name everywhere. Hosts that
+      # know their own name are not in the map and are left alone.
+      names = parse_key_value("${ALDGATE_DEVICE_MAP}",
+                key_value_delimiter: "=", field_delimiter: ",") ?? {}
+      sip = to_string(.source_ip) ?? ""
+      if sip != "" {
+        named = to_string(get(names, [sip]) ?? "") ?? ""
+        if named != "" { .host = downcase(named) }
+      }
+
+      # Strip the domain so `web01` and `web01.example.com` group together --
+      # unless the host IS an address, where the dots are the value and cutting
+      # at the first one leaves you filtering by "10".
+      if match(.host, r'^\d+\.\d+\.\d+\.\d+$') {
+        .host_short = .host
+      } else {
+        .host_short = replace(.host, r'\..*$', "")
+      }
 
       # --- severity and facility ------------------------------------------
       # Words for filtering, plus a number so "warning or worse" is a range
@@ -132,6 +318,30 @@ sinks:
     buffer:
       type: disk
       max_size: 2147483648
+      when_full: block
+    request:
+      retry_attempts: 25
+    healthcheck:
+      enabled: true
+
+  # Traps go to their own index and their own disk buffer. Same fields, same
+  # retention policy, separate queue -- so OpenSearch being slow to accept one
+  # stream cannot stall the other.
+  opensearch_snmp:
+    type: elasticsearch
+    inputs: [normalise_snmp]
+    endpoints: ["http://opensearch:9200"]
+    api_version: v7
+    auth:
+      strategy: basic
+      user: admin
+      password: "${ALDGATE_ADMIN_PASSWORD}"
+    mode: bulk
+    bulk:
+      index: "snmp-%Y.%m.%d"
+    buffer:
+      type: disk
+      max_size: 536870912
       when_full: block
     request:
       retry_attempts: 25

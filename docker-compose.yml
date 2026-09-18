@@ -125,6 +125,10 @@ services:
     restart: unless-stopped
     depends_on:
       opensearch: { condition: service_healthy }
+      # Traps are posted to Vector for normalisation, so it has to be up first.
+      # Telegraf retries a failed write, so a Vector restart costs latency, not
+      # traps -- but starting in the right order costs nothing.
+      vector: { condition: service_started }
     environment:
       - ALDGATE_ADMIN_PASSWORD=${ALDGATE_ADMIN_PASSWORD:?set it in .env}
     volumes:

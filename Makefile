@@ -16,7 +16,8 @@ help: ## Show this help
 render: .env ## Render vector.yaml.tmpl with the values from .env
 	@set -a; . ./.env; set +a; \
 	  export ALDGATE_TIMEZONE="$${ALDGATE_TIMEZONE:-UTC}"; \
-	  envsubst '$$ALDGATE_ADMIN_PASSWORD $$ALDGATE_TIMEZONE' < vector/vector.yaml.tmpl > vector/vector.rendered.yaml
+	  export ALDGATE_DEVICE_MAP="$${ALDGATE_DEVICE_MAP:-}"; \
+	  envsubst '$$ALDGATE_ADMIN_PASSWORD $$ALDGATE_TIMEZONE $$ALDGATE_DEVICE_MAP' < vector/vector.yaml.tmpl > vector/vector.rendered.yaml
 	@chmod 600 vector/vector.rendered.yaml
 	@echo "  rendered vector/vector.rendered.yaml"
 
