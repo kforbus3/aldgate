@@ -21,19 +21,28 @@ sources:
   # Two listeners on the same port because devices differ and you do not get to
   # choose: most network gear sends UDP, rsyslog is usually configured for TCP,
   # and both are RFC3164 or RFC5424 depending on age.
+  # timezone is the fallback for RFC3164 senders, which carry no offset at all.
+  # Without it their local time is read as UTC and they land hours in the past --
+  # which looks exactly like a host that has stopped sending, because a "last
+  # hour" search excludes them. Hosts enrolled by the playbook send RFC5424 with
+  # a real offset and ignore this; network gear that can only speak RFC3164
+  # depends on it, so set it to the LAN's timezone.
   syslog_udp:
     type: syslog
     address: 0.0.0.0:514
     mode: udp
+    timezone: ${ALDGATE_TIMEZONE}
   syslog_tcp:
     type: syslog
     address: 0.0.0.0:514
     mode: tcp
+    timezone: ${ALDGATE_TIMEZONE}
   # RFC5425 syslog-over-TLS for anything that can do it.
   syslog_tls:
     type: syslog
     address: 0.0.0.0:6514
     mode: tcp
+    timezone: ${ALDGATE_TIMEZONE}
 
 transforms:
   normalise:

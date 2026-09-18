@@ -76,6 +76,13 @@
           # not lose this host's logs: rsyslog spools to /var/spool/rsyslog and
           # drains when Aldgate comes back. Without this, anything logged during
           # an outage is gone, and you find out when you go looking for it.
+          # RFC5424, not the default RFC3164.
+          #
+          # RFC3164 sends "Sep 18 16:32:25" with NO timezone, so a collector in
+          # UTC files a host in EDT four hours in the past -- every search by
+          # time then misses that host, and a "last hour" view looks like the
+          # host has stopped sending. RFC5424 carries an explicit offset.
+          $ActionForwardDefaultTemplate RSYSLOG_SyslogProtocol23Format
           $WorkDirectory /var/spool/rsyslog
           $ActionQueueType LinkedList
           $ActionQueueFileName aldgate

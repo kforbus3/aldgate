@@ -58,12 +58,16 @@ services:
     volumes:
       - os-data:/usr/share/opensearch/data
     ports:
-      # LOOPBACK ONLY. Bound so the host's own tooling works -- bootstrap.sh
-      # applies the templates from here, and `make health` / `make test-syslog`
-      # query from here. 127.0.0.1 rather than 0.0.0.0 because nothing on the LAN
-      # has any business talking to the index directly: the UI is Dashboards and
-      # the API is Provenance's to broker.
-      - "127.0.0.1:9200:9200"
+      # Loopback by default, because the host's own tooling needs it --
+      # bootstrap.sh applies the templates from here and `make health` queries
+      # from here -- and because nothing on the LAN should be reading the index
+      # directly.
+      #
+      # Set ALDGATE_API_BIND=0.0.0.0 when Provenance runs on ANOTHER machine, as
+      # it does here: its Logs page brokers searches server-side and cannot do
+      # that over loopback on a different host. The security plugin is on, so
+      # what protects 9200 then is the credential, exactly as it protects 5601.
+      - "${ALDGATE_API_BIND:-127.0.0.1}:9200:9200"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS -u admin:$$ALDGATE_ADMIN_PASSWORD http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
       interval: 20s

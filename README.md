@@ -103,7 +103,22 @@ Daily indices, read-only after two days, deleted after 30. Change the window:
 | 514/udp, 514/tcp, 6514/tcp | every host and device on the LAN |
 | 162/udp | network devices |
 | 5601 | the UI. Set `ALDGATE_UI_BIND=127.0.0.1` once Provenance proxies it |
-| 9200 | **loopback only** — the host's own tooling. Never the LAN |
+| 9200 | loopback by default. Set `ALDGATE_API_BIND=0.0.0.0` only when Provenance is on another machine and needs to broker searches |
+
+## Timestamps
+
+Hosts enrolled by the playbook forward **RFC5424**, which carries an explicit
+UTC offset. That matters more than it sounds: RFC3164 — rsyslog's default — sends
+`Sep 18 16:32:25` with no timezone at all, so a collector in UTC files a host in
+EDT four hours in the past. Every time-based search then misses that host, and a
+"last hour" view looks exactly like a machine that has stopped sending.
+
+Network gear that can only speak RFC3164 is covered by `ALDGATE_TIMEZONE` in
+`.env`, which tells Vector what offset to assume. Set it to the LAN's timezone.
+
+Both timestamps are stored either way: `timestamp` is what the sender claimed,
+`received_at` is when it arrived. If they disagree, the sender's clock or
+timezone is wrong, and that is worth knowing rather than hiding.
 
 ## Notes worth keeping
 
