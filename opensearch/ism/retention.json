@@ -1,0 +1,34 @@
+{
+  "policy": {
+    "policy_id": "aldgate-retention",
+    "description": "Roll a daily index into read-only after a day, then delete it once it is older than the retention window. Logs are worth keeping until they are not, and nothing here is worth filling a disk for.",
+    "default_state": "hot",
+    "ism_template": [
+      { "index_patterns": ["syslog-*", "snmp-*"], "priority": 100 }
+    ],
+    "states": [
+      {
+        "name": "hot",
+        "actions": [],
+        "transitions": [
+          { "state_name": "warm", "conditions": { "min_index_age": "2d" } }
+        ]
+      },
+      {
+        "name": "warm",
+        "actions": [
+          { "read_only": {} },
+          { "force_merge": { "max_num_segments": 1 } }
+        ],
+        "transitions": [
+          { "state_name": "delete", "conditions": { "min_index_age": "RETENTION_DAYSd" } }
+        ]
+      },
+      {
+        "name": "delete",
+        "actions": [ { "delete": {} } ],
+        "transitions": []
+      }
+    ]
+  }
+}

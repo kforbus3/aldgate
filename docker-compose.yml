@@ -1,0 +1,137 @@
+# Aldgate — log and SNMP collection for the whole network.
+#
+# Four services, one job each:
+#
+#   opensearch   stores and searches. Apache-2.0, ES7-compatible API.
+#   dashboards   the UI: Discover for search, plus Alerting and Security Analytics.
+#   vector       RECEIVES syslog on 514 (udp+tcp), parses it, writes to opensearch.
+#   telegraf     RECEIVES SNMP traps on 162, and optionally polls devices.
+#
+# Everything is push: hosts and switches send to this box. Nothing here reaches
+# out to scrape, which is why enrolling a host is a config line rather than an
+# agent install.
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.6
+    container_name: aldgate-opensearch
+    restart: unless-stopped
+    environment:
+      # Single node: this is one VM and will stay one VM. Saying so avoids the
+      # cluster-formation wait that otherwise hangs startup for minutes.
+      - discovery.type=single-node
+      - cluster.name=aldgate
+      - node.name=aldgate-1
+      # Heap is HALF the container limit and never more than ~31g, per upstream
+      # guidance: the other half is for the filesystem cache that actually makes
+      # search fast, and above ~32g the JVM loses compressed object pointers.
+      - OPENSEARCH_JAVA_OPTS=-Xms3g -Xmx3g
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${ALDGATE_ADMIN_PASSWORD:?set it in .env}
+      # Passed in again under its own name because the HEALTHCHECK below needs
+      # it. Without this the check ran with an empty password, got 401 forever,
+      # and the container sat in `starting` while OpenSearch was serving
+      # perfectly -- which then blocked everything with depends_on: healthy.
+      # A healthcheck has to be tested inside the container before it is trusted.
+      - ALDGATE_ADMIN_PASSWORD=${ALDGATE_ADMIN_PASSWORD:?set it in .env}
+      # The security plugin stays ON -- this holds logs, so Dashboards must ask
+      # who you are. It mandates TRANSPORT (node-to-node) TLS and refuses to load
+      # without certificates; turning the demo config off left it with none and
+      # OpenSearch died with "Wrong Transport SSL configuration". So the demo
+      # config runs, purely because it is the supported thing that generates
+      # those certs. OPENSEARCH_INITIAL_ADMIN_PASSWORD below means `admin` gets
+      # the password from .env rather than a published default.
+      #
+      # HTTP TLS is off, and that is deliberate rather than lazy. Nothing outside
+      # this docker network can reach 9200 -- it publishes no port -- so the
+      # alternative is a self-signed certificate that every client then has to be
+      # told not to verify. A verify_certificate=false everywhere is worse than
+      # plaintext on a private bridge, because it looks like it is doing
+      # something.
+      - plugins.security.ssl.http.enabled=false
+      # Demo users other than admin (kibanaserver and friends) ship with known
+      # passwords. bootstrap.sh removes the ones nothing uses; the one Dashboards
+      # needs is reachable only from this network.
+      - plugins.security.restapi.roles_enabled=["all_access","security_rest_api_access"]
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile:  { soft: 65536, hard: 65536 }
+    volumes:
+      - os-data:/usr/share/opensearch/data
+    ports:
+      # LOOPBACK ONLY. Bound so the host's own tooling works -- bootstrap.sh
+      # applies the templates from here, and `make health` / `make test-syslog`
+      # query from here. 127.0.0.1 rather than 0.0.0.0 because nothing on the LAN
+      # has any business talking to the index directly: the UI is Dashboards and
+      # the API is Provenance's to broker.
+      - "127.0.0.1:9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -u admin:$$ALDGATE_ADMIN_PASSWORD http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    networks: [aldgate]
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.6
+    container_name: aldgate-dashboards
+    restart: unless-stopped
+    depends_on:
+      opensearch: { condition: service_healthy }
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      # Dashboards authenticates to OpenSearch as its own service account, and
+      # asks the human for their own credentials at the login screen. Running it
+      # as `admin` would make every browser session administrative.
+      - OPENSEARCH_USERNAME=kibanaserver
+      - OPENSEARCH_PASSWORD=${ALDGATE_DASHBOARDS_PASSWORD:-kibanaserver}
+      - OPENSEARCH_SSL_VERIFICATIONMODE=none
+      # Served under a sub-path so Provenance can proxy it at /aldgate/ and frame
+      # it, the same arrangement the Kubernetes console uses.
+      - SERVER_BASEPATH=${ALDGATE_BASEPATH:-}
+      - SERVER_REWRITEBASEPATH=${ALDGATE_REWRITE_BASEPATH:-false}
+    ports:
+      - "${ALDGATE_UI_BIND:-0.0.0.0}:5601:5601"
+    networks: [aldgate]
+
+  vector:
+    image: timberio/vector:0.58.0-alpine
+    container_name: aldgate-vector
+    restart: unless-stopped
+    depends_on:
+      opensearch: { condition: service_healthy }
+    environment:
+      - ALDGATE_ADMIN_PASSWORD=${ALDGATE_ADMIN_PASSWORD:?set it in .env}
+    volumes:
+      # Rendered by `make up` from vector.yaml.tmpl -- see the note in that file.
+      - ./vector/vector.rendered.yaml:/etc/vector/vector.yaml:ro
+      - vector-data:/var/lib/vector
+    ports:
+      # 514 is the privileged syslog port every device already knows how to send
+      # to. Published on the host so switches, routers and hosts can reach it.
+      - "514:514/udp"
+      - "514:514/tcp"
+      # RFC5425 syslog-over-TLS, for anything that can do it.
+      - "6514:6514/tcp"
+    networks: [aldgate]
+
+  telegraf:
+    image: telegraf:1.40.0-alpine
+    container_name: aldgate-telegraf
+    restart: unless-stopped
+    depends_on:
+      opensearch: { condition: service_healthy }
+    environment:
+      - ALDGATE_ADMIN_PASSWORD=${ALDGATE_ADMIN_PASSWORD:?set it in .env}
+    volumes:
+      - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+    ports:
+      - "162:162/udp"
+    networks: [aldgate]
+
+volumes:
+  os-data:
+  vector-data:
+
+networks:
+  aldgate:

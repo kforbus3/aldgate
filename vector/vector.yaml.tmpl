@@ -1,0 +1,130 @@
+# Vector: receive syslog, make it readable, write it to OpenSearch.
+#
+# THIS IS A TEMPLATE. `make up` renders it to vector.rendered.yaml with envsubst
+# and mounts that. Vector's own ${VAR} interpolation is NOT relied on: it left
+# the placeholder text in place as the literal password, so every write got 401
+# from OpenSearch while the credentials in the environment were perfectly good.
+# Rendering makes what Vector reads exactly what is on disk, which is also what
+# you can inspect when something is wrong.
+#
+# The readability is the point. Raw syslog is a timestamp, a host, a priority
+# number and a blob, and a search UI over that is a grep with extra steps. So
+# every message is normalised into the same small set of fields, the priority
+# number is decoded into words a person can filter on, and anything that parsed
+# badly is kept rather than dropped -- a log collector that silently discards
+# what it could not parse is worse than no collector, because you cannot tell
+# the difference between "nothing happened" and "nothing arrived".
+
+data_dir: /var/lib/vector
+
+sources:
+  # Two listeners on the same port because devices differ and you do not get to
+  # choose: most network gear sends UDP, rsyslog is usually configured for TCP,
+  # and both are RFC3164 or RFC5424 depending on age.
+  syslog_udp:
+    type: syslog
+    address: 0.0.0.0:514
+    mode: udp
+  syslog_tcp:
+    type: syslog
+    address: 0.0.0.0:514
+    mode: tcp
+  # RFC5425 syslog-over-TLS for anything that can do it.
+  syslog_tls:
+    type: syslog
+    address: 0.0.0.0:6514
+    mode: tcp
+
+transforms:
+  normalise:
+    type: remap
+    inputs: [syslog_udp, syslog_tcp, syslog_tls]
+    # Never drop. A message that fails here still reaches OpenSearch with
+    # whatever was understood, plus the reason it was hard.
+    drop_on_error: false
+    drop_on_abort: false
+    source: |
+      # VRL is strict about fallibility: del() and now() cannot fail, so `??` on
+      # them is a compile error, while to_string() can fail and must be handled.
+      # Written as explicit null checks rather than a chain of `??` for that
+      # reason -- and because it is readable a year from now.
+      .observer = "aldgate"
+      .log_type = "syslog"
+
+      # --- host -----------------------------------------------------------
+      # Always present, because it is the first thing anyone filters by.
+      h = del(.hostname)
+      if h == null { h = del(.host) }
+      if h == null { h = .source_ip }
+      hs = to_string(h) ?? "unknown"
+      if hs == "" { hs = "unknown" }
+      .host = downcase(hs)
+      # Strip the domain so `web01` and `web01.example.com` group together.
+      .host_short = replace(.host, r'\..*$', "")
+
+      # --- severity and facility ------------------------------------------
+      # Words for filtering, plus a number so "warning or worse" is a range
+      # query instead of a list of strings somebody has to remember.
+      sev = to_string(.severity) ?? "unknown"
+      .severity = downcase(sev)
+      fac = to_string(.facility) ?? "unknown"
+      .facility = downcase(fac)
+      ranks = {
+        "emerg": 0, "emergency": 0, "alert": 1, "crit": 2, "critical": 2,
+        "err": 3, "error": 3, "warn": 4, "warning": 4,
+        "notice": 5, "info": 6, "informational": 6, "debug": 7
+      }
+      sc = get(ranks, [.severity]) ?? 6
+      if sc == null { sc = 6 }
+      .severity_code = sc
+
+      # --- program --------------------------------------------------------
+      pr = del(.appname)
+      if pr == null { pr = .program }
+      if pr == null { pr = "unknown" }
+      .program = to_string(pr) ?? "unknown"
+      if exists(.procid) { .pid = to_string(del(.procid)) ?? "" }
+
+      # --- message --------------------------------------------------------
+      # One canonical text field. Discover shows a chosen field as the message
+      # column, and it being reliably present is most of what readable means.
+      m = .message
+      if m == null { m = del(.body) }
+      if m == null { m = "" }
+      .message = to_string(m) ?? ""
+
+      # --- time -----------------------------------------------------------
+      # Both, because devices with a wrong clock are common: `timestamp` is what
+      # the sender claimed, `received_at` is when it actually arrived here.
+      .received_at = now()
+      if !exists(.timestamp) { .timestamp = .received_at }
+
+      # --- sender ---------------------------------------------------------
+      if exists(.source_ip) { .source_address = del(.source_ip) }
+
+sinks:
+  opensearch:
+    type: elasticsearch
+    inputs: [normalise]
+    endpoints: ["http://opensearch:9200"]
+    # OpenSearch 2.x speaks the Elasticsearch 7.10 API. Pinned rather than
+    # auto-detected: auto-detection reads the reported version (2.x) and can
+    # decide it is talking to something much older than it is.
+    api_version: v7
+    auth:
+      strategy: basic
+      user: admin
+      password: "${ALDGATE_ADMIN_PASSWORD}"
+    mode: bulk
+    bulk:
+      index: "syslog-%Y.%m.%d"
+    # A collector that loses what it received during a restart or a brief
+    # OpenSearch outage is not a collector. Buffer to disk.
+    buffer:
+      type: disk
+      max_size: 2147483648
+      when_full: block
+    request:
+      retry_attempts: 25
+    healthcheck:
+      enabled: true

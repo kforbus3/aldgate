@@ -1,0 +1,106 @@
+---
+# Point a host's rsyslog at Aldgate.
+#
+# Run from Provenance (Automation -> Playbooks) against any group, or with
+# ansible-playbook directly.
+#
+# Enrolling is a config file plus, on some hosts, one small package. I assumed
+# every Debian host already ran rsyslog; the cloud-image VMs (k3s, identity,
+# this collector) ship with journald ONLY -- no rsyslog, no /etc/rsyslog.d --
+# so an earlier version of this playbook silently skipped exactly the hosts
+# built most recently. It installs it now.
+#
+# rsyslog rather than systemd-journal-upload because journal-upload speaks a
+# systemd-specific protocol to systemd-journal-remote, not syslog, and would
+# mean a second receiver for a subset of hosts. One protocol, one receiver.
+#
+#   ansible-playbook -i <inventory> ansible/enroll-syslog.yml -e aldgate_host=10.10.0.177
+#
+# Idempotent: re-running changes nothing once the file matches.
+- name: Enrol hosts into Aldgate log collection
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    aldgate_host: "10.10.0.177"
+    aldgate_port: 514
+    # TCP by default. UDP loses messages silently under load and gives no
+    # back-pressure, which is the wrong trade for an audit trail; @@ is TCP in
+    # rsyslog's syntax, @ is UDP.
+    aldgate_protocol: "@@"
+    # Keep a local copy. A collector that becomes the only copy is a collector
+    # whose outage is a blind spot.
+    aldgate_keep_local: true
+
+  tasks:
+    - name: Is rsyslog already installed?
+      ansible.builtin.stat:
+        path: /etc/rsyslog.conf
+      register: rsyslog_conf
+
+    - name: Install rsyslog where the host has only journald
+      ansible.builtin.package:
+        name: rsyslog
+        state: present
+      when: not rsyslog_conf.stat.exists
+      register: rsyslog_installed
+
+    - name: Re-check after installing
+      ansible.builtin.stat:
+        path: /etc/rsyslog.conf
+      register: rsyslog_conf
+      when: rsyslog_installed is changed
+
+    - name: Forward the journal into syslog
+      # journald keeps its own store and only feeds rsyslog when told to. Without
+      # this, a freshly installed rsyslog forwards almost nothing and the host
+      # looks enrolled while sending nothing worth reading.
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/journald.conf
+        regexp: '^#?ForwardToSyslog='
+        line: 'ForwardToSyslog=yes'
+        state: present
+      notify: Restart journald
+
+    - name: Install the forwarding rule
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/60-aldgate.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Aldgate (ansible/enroll-syslog.yml). Local edits are lost
+          # on the next run.
+          #
+          # A disk-assisted queue so a collector outage or a reboot of it does
+          # not lose this host's logs: rsyslog spools to /var/spool/rsyslog and
+          # drains when Aldgate comes back. Without this, anything logged during
+          # an outage is gone, and you find out when you go looking for it.
+          $WorkDirectory /var/spool/rsyslog
+          $ActionQueueType LinkedList
+          $ActionQueueFileName aldgate
+          $ActionQueueMaxDiskSpace 256m
+          $ActionQueueSaveOnShutdown on
+          $ActionResumeRetryCount -1
+          *.* {{ aldgate_protocol }}{{ aldgate_host }}:{{ aldgate_port }}
+      notify: Restart rsyslog
+
+    - name: Ensure the spool directory exists
+      ansible.builtin.file:
+        path: /var/spool/rsyslog
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+  handlers:
+    - name: Restart journald
+      ansible.builtin.service:
+        name: systemd-journald
+        state: restarted
+
+    - name: Restart rsyslog
+      ansible.builtin.service:
+        name: rsyslog
+        state: restarted
+        enabled: true

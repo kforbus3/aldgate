@@ -1,0 +1,34 @@
+{
+  "index_patterns": ["syslog-*"],
+  "priority": 100,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "10s",
+      "index.plugins.index_state_management.policy_id": "aldgate-retention"
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "timestamp":      { "type": "date" },
+        "received_at":    { "type": "date" },
+        "host":           { "type": "keyword" },
+        "host_short":     { "type": "keyword" },
+        "program":        { "type": "keyword" },
+        "pid":            { "type": "keyword" },
+        "severity":       { "type": "keyword" },
+        "severity_code":  { "type": "short" },
+        "facility":       { "type": "keyword" },
+        "source_address": { "type": "ip" },
+        "observer":       { "type": "keyword" },
+        "log_type":       { "type": "keyword" },
+        "message":        { "type": "text",
+                            "fields": { "keyword": { "type": "keyword", "ignore_above": 1024 } } }
+      }
+    }
+  },
+  "_meta": {
+    "why": "host/program/severity are keyword because every useful narrowing is an exact filter, not a text match. message is text (for searching words) with a keyword sub-field (for grouping identical lines). severity_code is numeric so 'warning or worse' is a range query. number_of_replicas is 0 because a single node cannot place a replica and a yellow cluster on day one confuses everyone."
+  }
+}

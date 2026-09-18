@@ -1,0 +1,58 @@
+---
+# Send CONTAINER logs to Aldgate as well.
+#
+# Host syslog does not include what runs inside containers: docker keeps those
+# in its own json-file logs, so a fleet enrolled by enroll-syslog.yml still has
+# a hole exactly where the interesting things happen. Setting the daemon's
+# default log driver closes it for every container created afterwards.
+#
+# Deliberately NOT applied to containers that already exist -- changing a
+# container's log driver requires recreating it, and recreating somebody's
+# database because a log setting changed is not a decision a playbook should
+# make. Recreate them when you next deploy them.
+- name: Send docker container logs to Aldgate
+  hosts: all
+  become: true
+  vars:
+    aldgate_host: "10.10.0.177"
+    aldgate_port: 514
+  tasks:
+    - name: Is this a docker host?
+      ansible.builtin.stat:
+        path: /etc/docker
+      register: docker_dir
+
+    - name: Read the existing daemon.json
+      ansible.builtin.slurp:
+        src: /etc/docker/daemon.json
+      register: daemon_raw
+      failed_when: false
+      when: docker_dir.stat.exists
+
+    - name: Merge the log driver into daemon.json
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+        # Merged rather than overwritten: these hosts have real daemon.json
+        # settings (registry mirrors, storage options) that must survive.
+        content: "{{ existing | combine(wanted) | to_nice_json }}"
+      vars:
+        existing: >-
+          {{ (daemon_raw.content | b64decode | from_json)
+             if (daemon_raw is defined and daemon_raw.content is defined) else {} }}
+        wanted:
+          log-driver: syslog
+          log-opts:
+            syslog-address: "tcp://{{ aldgate_host }}:{{ aldgate_port }}"
+            tag: "{% raw %}{{.Name}}{% endraw %}"
+            syslog-format: rfc5424micro
+      when: docker_dir.stat.exists
+      notify: Restart docker
+
+  handlers:
+    - name: Restart docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted

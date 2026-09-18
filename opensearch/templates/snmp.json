@@ -1,0 +1,30 @@
+{
+  "index_patterns": ["snmp-*"],
+  "priority": 100,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "10s",
+      "index.plugins.index_state_management.policy_id": "aldgate-retention"
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "timestamp":  { "type": "date" },
+        "host":       { "type": "keyword" },
+        "source":     { "type": "keyword" },
+        "log_type":   { "type": "keyword" },
+        "name":       { "type": "keyword" },
+        "oid":        { "type": "keyword" },
+        "mib":        { "type": "keyword" },
+        "version":    { "type": "keyword" },
+        "community":  { "type": "keyword" }
+      }
+    }
+  },
+  "_meta": {
+    "why": "Trap variables are unpredictable, so dynamic mapping stays on; only the fields you filter by are pinned. oid and mib are keyword so a trap type can be filtered exactly."
+  }
+}
