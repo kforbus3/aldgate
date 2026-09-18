@@ -1,0 +1,50 @@
+---
+# Forward OpenWrt's log to Aldgate.
+#
+# raw throughout and gather_facts off: OpenWrt has no python, so every other
+# module is unavailable. uci set is idempotent, so this is safe to re-run -- the
+# log service is only restarted when something actually changed.
+#
+# logd speaks RFC3164, which carries no timezone. Aldgate's ALDGATE_TIMEZONE
+# covers that; without it this router's messages land hours in the past and fall
+# out of every "last hour" search. See the Timestamps section of Aldgate's README.
+- name: Forward OpenWrt syslog to Aldgate
+  hosts: all
+  gather_facts: false
+  become: false
+  vars:
+    aldgate_host: 10.10.0.177
+    aldgate_port: 514
+    aldgate_proto: udp
+  tasks:
+    - name: Read the current remote-log settings
+      ansible.builtin.raw: >-
+        uci -q get system.@system[0].log_ip || true
+      register: before
+      changed_when: false
+
+    - name: Point the log at Aldgate
+      ansible.builtin.raw: >-
+        uci set system.@system[0].log_ip='{{ aldgate_host }}' &&
+        uci set system.@system[0].log_port='{{ aldgate_port }}' &&
+        uci set system.@system[0].log_proto='{{ aldgate_proto }}' &&
+        uci commit system
+      register: applied
+      changed_when: before.stdout | trim != aldgate_host
+
+    - name: Restart logging only if the target changed
+      ansible.builtin.raw: /etc/init.d/log restart
+      when: before.stdout | trim != aldgate_host
+      changed_when: true
+
+    - name: Send a marker so you can confirm it arrived
+      ansible.builtin.raw: logger -t aldgate-enrolment "forwarding to {{ aldgate_host }}:{{ aldgate_port }} enabled"
+      changed_when: false
+
+    - name: Show the resulting configuration
+      ansible.builtin.raw: uci show system.@system[0] | grep -E 'log_(ip|port|proto)'
+      register: after
+      changed_when: false
+
+    - ansible.builtin.debug:
+        var: after.stdout_lines

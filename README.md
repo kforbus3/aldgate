@@ -54,31 +54,38 @@ existing containers; they pick it up next time they are deployed.
 
 ### Network devices
 
-**MikroTik RouterOS.** Note `syslog-time-format=iso8601` — the default BSD
-format carries no timezone, and see [Timestamps](#timestamps) for what that
-costs. Check `/system/logging/print` first: the four default rules already point
-at a `remote` action, so on most installs there is nothing to add and one thing
-to repoint.
+Network gear rarely allows key auth, so these run through Provenance, which
+holds the device passwords. Both are plain playbooks and work with
+`ansible-playbook` too if you have credentials of your own.
 
-    /system logging action set [find name=remote] remote=<collector> remote-port=514 \
-        remote-log-format=syslog syslog-time-format=iso8601
-    /snmp set enabled=yes trap-target=<collector> trap-version=2 trap-community=public \
-        trap-generators=interfaces,temp-exception
+**MikroTik RouterOS** — `ansible/enroll-routeros.yml`. Syslog and SNMP traps in
+one pass. It does four things worth knowing about:
 
-Enabling SNMP for traps also opens the read-only agent, so restrict who may
-query it — the community list is `::/0` out of the box:
+- points the existing `remote` logging action at the collector, because the four
+  default rules already route to it — on a stock device there is nothing to add
+- `syslog-time-format=iso8601`, so the timestamp carries an offset (see
+  [Timestamps](#timestamps) for what the default costs you)
+- `syslog-severity=auto`, so severity comes from the logging topic. A device with
+  a fixed severity stamps every message with it: the cAP here was sending "admin
+  logged out" as **emerg**, so a search for "error or worse" returned its whole
+  log and buried everything real
+- narrows the SNMP community to the collector, because enabling SNMP for traps
+  also opens the read-only agent and the community list ships as `::/0`
 
-    /snmp community set [find name=public] addresses=<collector>/32
+Both MikroTik devices here had their `remote` action aimed at a host where
+nothing listens — configured, forwarding, and arriving nowhere. Check where
+yours points before assuming it is unconfigured:
+
+    /system logging action print detail where name=remote
 
 **MikroTik SwOS** (the CRS3xx switches) has neither syslog nor traps. It is
 configured over HTTP only; there is nothing to enrol.
 
-**OpenWrt**
+**MikroTik SwOS** (the CRS3xx switches) has neither syslog nor traps. It is
+configured over HTTP only; there is nothing to enrol.
 
-    uci set system.@system[0].log_ip='<collector>'
-    uci set system.@system[0].log_port='514'
-    uci set system.@system[0].log_proto='tcp'
-    uci commit system && /etc/init.d/log restart
+**OpenWrt** — `ansible/enroll-openwrt.yml`. `raw` throughout, because OpenWrt
+has no python and every other module needs it.
 
 **Proxmox** — it is Debian; use the playbook.
 
@@ -190,9 +197,18 @@ accepted without complaint; the body still arrives as a JSON *string* in
 `.message`, which the transform then overwrites. Every trap indexed as a
 well-formed document with every field empty. The option is `decoding.codec`.
 
-**Not everything can be enrolled from here.** The OpenWrt router and the NAS
-refuse key auth, so their forwarding has to be set from their own UIs. The
-commands are above; nothing else is needed on the collector.
+**`raw` hangs against RouterOS.** Ansible's paramiko connection opens an exec
+channel that RouterOS never closes, so the first task sits there until something
+kills the run — no error, no output, nothing to diagnose. The RouterOS playbook
+uses `community.routeros.command` over `network_cli`, which speaks the console
+properly. OpenWrt is fine with `raw`.
+
+**Network gear refuses key auth**, so it cannot be enrolled from a laptop with
+an SSH key — the credentials live in Provenance's vault. Run the two device
+playbooks from Provenance (Automation → Playbooks); it injects the password per
+host. Note that Provenance's *Run command* page cannot do this: it dials with
+certificates only, so a vault-credential host fails there with a bare "unable to
+authenticate".
 
 - **OpenSearch's security plugin mandates transport TLS** and refuses to load
   without certificates. Turning off the demo config removes the thing that

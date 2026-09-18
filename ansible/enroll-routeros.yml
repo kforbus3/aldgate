@@ -1,0 +1,100 @@
+---
+# Point a MikroTik RouterOS device at Aldgate: syslog and SNMP traps.
+#
+# community.routeros.command over network_cli, NOT ansible.builtin.raw. raw uses
+# paramiko's exec channel, and RouterOS never closes it -- the first task simply
+# hangs until the run is killed, with no error to explain why. network_cli speaks
+# RouterOS's console properly. Every command here is idempotent, so re-running is
+# a no-op.
+#
+# Two details that matter more than they look:
+#
+# * syslog-time-format=iso8601. The default BSD format carries no timezone, so a
+#   collector in UTC files an EDT device four hours in the past and it vanishes
+#   from every time-based search -- which reads exactly like a device that has
+#   stopped sending.
+#
+# * syslog-severity=auto. A device with a fixed severity stamps EVERY message
+#   with it: the cAP here was sending "admin logged out" as emerg, so any search
+#   for "error or worse" returned its entire log and buried everything real.
+#   auto derives the severity from the logging topic, as the core switch does.
+#
+# * Enabling SNMP for traps also opens the read-only agent, and the community
+#   list ships as ::/0. The last task narrows it to the collector, so turning on
+#   traps does not quietly make the device readable from anywhere.
+- name: Forward RouterOS syslog and SNMP traps to Aldgate
+  hosts: all
+  gather_facts: false
+  become: false
+  vars:
+    ansible_connection: ansible.netcommon.network_cli
+    ansible_network_os: community.routeros.routeros
+    aldgate_host: 10.10.0.177
+    aldgate_port: 514
+    snmp_community: public
+  tasks:
+    - name: Show what is configured now
+      community.routeros.command:
+        commands:
+          - /system logging action print detail where name=remote
+      register: before
+      changed_when: false
+
+    - ansible.builtin.debug:
+        var: before.stdout_lines
+
+    - name: Point the remote logging action at Aldgate
+      community.routeros.command:
+        commands:
+          - >-
+              /system logging action set [find name=remote]
+              remote={{ aldgate_host }} remote-port={{ aldgate_port }}
+              remote-log-format=syslog syslog-time-format=iso8601
+              syslog-severity=auto syslog-facility=daemon
+      changed_when: true
+
+    - name: Make sure something actually routes to it
+      # The four default rules point at the remote action on a stock device, but
+      # a device someone has tidied may have none -- in which case it is
+      # configured to forward and forwards nothing.
+      community.routeros.command:
+        commands:
+          - >-
+              :if ([:len [/system logging find where action=remote]] = 0) do={
+              /system logging add topics=info action=remote;
+              /system logging add topics=error action=remote;
+              /system logging add topics=warning action=remote;
+              /system logging add topics=critical action=remote }
+      changed_when: false
+
+    - name: Send traps to Aldgate
+      community.routeros.command:
+        commands:
+          - >-
+              /snmp set enabled=yes trap-target={{ aldgate_host }} trap-version=2
+              trap-community={{ snmp_community }}
+              trap-generators=interfaces,temp-exception
+      changed_when: true
+
+    - name: Restrict who may read the SNMP agent
+      community.routeros.command:
+        commands:
+          - >-
+              /snmp community set [find name={{ snmp_community }}] addresses={{ aldgate_host }}/32
+      changed_when: true
+
+    - name: Leave a marker you can search for
+      community.routeros.command:
+        commands:
+          - ':log warning "aldgate enrolment: forwarding to {{ aldgate_host }}"'
+      changed_when: false
+
+    - name: Show the result
+      community.routeros.command:
+        commands:
+          - /snmp print
+      register: after
+      changed_when: false
+
+    - ansible.builtin.debug:
+        var: after.stdout_lines
