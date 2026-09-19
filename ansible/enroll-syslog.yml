@@ -27,6 +27,11 @@
     # out of what gets FORWARDED (never out of the host's own logs) -- see the
     # forwarding rule below for why and for exactly what survives.
     aldgate_service_accounts: [prov, prov-login, fleet, fleet-login]
+    # The addresses Provenance connects FROM: its host and its overlay. Used to
+    # filter connection-teardown lines that are its own, while keeping the
+    # identical lines from anywhere else -- on an internet-facing host
+    # "Connection closed by <someone>" is a scan, and that is worth seeing.
+    aldgate_control_plane_addresses: ["10.10.0.208", "10.100.0.1"]
     aldgate_port: 514
     # TCP by default. UDP loses messages silently under load and gives no
     # back-pressure, which is the wrong trade for an audit trail; @@ is TCP in
@@ -156,7 +161,7 @@
                 or $msg contains "timers.target" or $msg contains "shutdown.target"
                 or $msg contains "User Runtime Directory"
                 or $msg contains "User Manager for UID" or $msg contains "Queued start job"
-                or $msg contains "fleet-wg-reresolve") then
+                or $msg contains "wireplumber" or $msg contains "wg-reresolve") then
               set $.aldgate_noise = 1;
           }
 
@@ -185,9 +190,108 @@
             set $.aldgate_noise = 1;
           {% endfor %}
 
+          # Desktop and audio session services. They exist to make a graphical
+          # session work, they start and stop with every login, and they say
+          # nothing about the machine's health. Warning or worse still arrives.
+          if not ($syslogseverity <= 4) and ($programname == "rtkit-daemon"
+              or $programname == "wireplumber" or $programname startswith "pipewire"
+              or $programname == "mpris-proxy" or $programname == "gnome-keyring-daemon"
+              or $programname == "speech-dispatcher" or $programname == "pulseaudio"
+              or $programname == "systemd-xdg-autostart-generator"
+              or $programname == "at-spi-bus-launcher") then
+            set $.aldgate_noise = 1;
+
+          # systemd's bookkeeping for per-session units -- sockets, slices and
+          # scopes opening and closing. One line per unit per login, and on a host
+          # with a desktop installed that is dozens of lines per probe.
+          #
+          # This does also drop socket-activation records at boot and container
+          # scope lines, both at info level. Docker and containerd log their own
+          # container lifecycle, boots are visible a dozen other ways, and
+          # anything that FAILS is warning or worse and still arrives.
+          if ($programname startswith "systemd") and not ($syslogseverity <= 4)
+             and ($msg contains ".socket" or $msg contains ".slice"
+                  or $msg contains ".scope" or $msg contains "pipewire"
+                  or $msg contains "gnome-keyring" or $msg contains "speech-dispatcher"
+                  or $msg contains "mpris-proxy" or $msg contains "filter-chain"
+                  or $msg contains "pk-debconf-helper" or $msg contains "dbus.service"
+                  or $msg contains "at-spi") then
+            set $.aldgate_noise = 1;
+
+          # logind's records for the service accounts, and the bare "Removed
+          # session N" lines that name nobody at all. A human's session open and
+          # close are still recorded by sshd's pam_unix lines, which are kept, so
+          # nothing about a person's access is lost here.
+          {% for acct in aldgate_service_accounts %}
+          if ($programname == "systemd-logind") and not ($syslogseverity <= 4)
+             and ($msg contains "of user {{ acct }}.") then
+            set $.aldgate_noise = 1;
+          {% endfor %}
+          if ($programname == "systemd-logind") and not ($syslogseverity <= 4)
+             and ($msg contains "Removed session ") then
+            set $.aldgate_noise = 1;
+
+          # cron's PAM session pairs. The job itself -- the CMD line naming what
+          # ran -- is kept, because that is the part that answers a question.
+          if not ($syslogseverity <= 4) and ($msg contains "pam_unix(cron:session)") then
+            set $.aldgate_noise = 1;
+
+          # sshd's connection teardown for the service accounts.
+          {% for acct in aldgate_service_accounts %}
+          if ($programname startswith "sshd") and not ($syslogseverity <= 4)
+             and ($msg contains "Disconnected from user {{ acct }} "
+                  or $msg contains "Starting session: command for {{ acct }} ") then
+            set $.aldgate_noise = 1;
+          {% endfor %}
+
+          # sudo's PAM session pairs, when the caller is a service account. The
+          # line that matters -- `prov : PWD=... COMMAND=...`, naming what actually
+          # ran as root -- is kept; "session opened for user root by prov" adds
+          # nothing to it and arrives twice per sudo.
+          {% for acct in aldgate_service_accounts %}
+          if not ($syslogseverity <= 4) and ($msg contains "pam_unix(sudo:session)")
+             and ($msg contains "by {{ acct }}(") then
+            set $.aldgate_noise = 1;
+          {% endfor %}
+
+          # The ONE place this drops a high-severity line, and deliberately.
+          #
+          # sshd logs `fatal: ssh_packet_send_debug: send DEBUG: Broken pipe` at
+          # CRIT when a client vanishes mid-exchange, which is what the monitor's
+          # probe does every 30 seconds after it has what it came for. Nothing is
+          # wrong, but at crit it lands in every "critical" search and every alert
+          # built on severity -- the effect of leaving it is that severity stops
+          # meaning anything. Matched on the exact text, so a real fatal from sshd
+          # still arrives.
+          if ($programname startswith "sshd") and ($msg contains "ssh_packet_send_debug") then
+            set $.aldgate_noise = 1;
+
+          # Connection teardown from the control plane's own addresses. The same
+          # line from any other address survives, because on a host reachable from
+          # outside it is a scan and worth keeping.
+          {% for addr in aldgate_control_plane_addresses %}
+          if ($programname startswith "sshd") and not ($syslogseverity <= 4)
+             and ($msg contains "Connection closed by {{ addr }} "
+                  or $msg contains "Connection closed by authenticating user"
+                  and $msg contains "{{ addr }}") then
+            set $.aldgate_noise = 1;
+          {% endfor %}
+
+          # logind's teardown chatter, which names no account and says nothing a
+          # person would act on. Session open and close are still recorded.
+          if ($programname == "systemd-logind") and not ($syslogseverity <= 4)
+             and ($msg contains "logged out. Waiting for processes") then
+            set $.aldgate_noise = 1;
+
           # sshd's byte counter, which carries no information about who did what.
           # Outside the account loop because it names nobody to key on.
-          if ($programname startswith "sshd") and ($msg startswith "Transferred: sent ") then
+          #
+          # `contains`, not `startswith`: rsyslog's $msg keeps the leading space
+          # that separates it from the tag, so a startswith test against the first
+          # word never matches and the rule silently does nothing. Two rules here
+          # were written that way and were dead until a behaviour test caught one
+          # of them arriving when it should not have.
+          if ($programname startswith "sshd") and ($msg contains "Transferred: sent ") then
             set $.aldgate_noise = 1;
 
           if $.aldgate_noise == 0 then {

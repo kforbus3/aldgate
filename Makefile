@@ -21,6 +21,16 @@ render: .env ## Render vector.yaml.tmpl with the values from .env
 	@chmod 600 vector/vector.rendered.yaml
 	@echo "  rendered vector/vector.rendered.yaml"
 
+enroll-self: ## Forward this collector's OWN logs into itself
+	@# The config is a FILE, not a heredoc: make expands $$ in a recipe, so
+	@# rsyslog's $$msg and $$programname arrive mangled -- the first version of
+	@# this wrote "orkDirectory" and the target died on its own output.
+	@sudo install -d -m 0700 /var/spool/rsyslog
+	@sudo install -m 0644 rsyslog/60-aldgate-self.conf /etc/rsyslog.d/60-aldgate-self.conf
+	@sudo rsyslogd -N1 >/dev/null 2>&1 || { echo "  rsyslog REJECTED the config; reverting"; sudo rm -f /etc/rsyslog.d/60-aldgate-self.conf; exit 1; }
+	@sudo systemctl restart rsyslog
+	@echo "  this collector now forwards its own logs to itself"
+
 up: .env render ## Start the stack and apply templates/retention/index patterns
 	$(COMPOSE) up -d
 	@set -a; . ./.env; set +a; ./bootstrap/bootstrap.sh
