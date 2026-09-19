@@ -8,52 +8,46 @@ out to scrape.
                                                      ├──► OpenSearch ──► Dashboards
     SNMP traps (162/udp) ─────────────────► Telegraf ┘
 
-## Quick start
-
-Any Debian/Ubuntu machine with Docker. 4 GB RAM is enough for a small fleet; this
-one runs 4 vCPU / 8 GB and holds ~90 MB of logs a day from nineteen hosts.
-
-```bash
-git clone https://github.com/kforbus3/aldgate && cd aldgate
-make up                     # generates .env with a random admin password, starts everything,
-                            # applies index templates, retention and the shipped dashboard
-make health                 # what is arriving, per host
-```
-
-That is the collector running and listening. Nothing is sending to it yet — see
-[Enrol a host](#enrol-a-host), which is one playbook run per machine and two
-commands per network device.
-
-Then, to read the logs inside Provenance rather than here, see
-[docs/provenance-integration.md](./docs/provenance-integration.md): four values
-from this box's `.env` into Provenance's, and the Logs page starts working.
-
 | Component | Why this one |
 |---|---|
 | **OpenSearch 2.19** + Dashboards | Apache-2.0, full-text search, and Alerting and Security Analytics (SIEM rules) included rather than gated behind a licence tier. |
 | **Vector** | One small Rust binary that speaks syslog properly (RFC3164 *and* 5424), transforms without a JVM, and buffers to disk so a restart does not lose what it already received. |
 | **Telegraf** | Vector cannot do SNMP. Telegraf receives traps *and* can poll devices, so one agent covers both halves. |
 
-## Deploy
+## What you do, in order
 
-On a Debian host with Docker:
+Roughly half an hour end to end, and the collector is useful after step 2.
 
-    git clone <this repo> aldgate && cd aldgate
+| # | Step | Time | You get |
+|---|---|---|---|
+| 1 | [Deploy the collector](#deploy-the-collector) | 5 min | somewhere listening on 514 and 162 |
+| 2 | [Enrol your Linux hosts](#enrol-a-host) | one playbook run | every machine's syslog, searchable, with Provenance's own probe noise filtered out |
+| 3 | [Enrol network devices](#network-devices) | 2 min each | switches, routers and APs — the places an outage is visible first |
+| 4 | [Read it inside Provenance](./docs/provenance-integration.md) | 5 min | one identity, an audit trail of who searched what, and the console without a second password |
+| 5 | [Set retention](#retention) and check [what is exposed](#what-is-exposed) | 5 min | a disk that does not fill, and 9200 reachable only by what needs it |
+
+## Deploy the collector
+
+Any Debian/Ubuntu machine with Docker. 4 GB RAM is enough for a small fleet; this
+one runs 4 vCPU / 8 GB and takes **~66 MB of logs a day** — about 384,000 messages
+— from nineteen hosts and four network devices.
+
+    git clone https://github.com/kforbus3/aldgate && cd aldgate
     make up
 
-That is the whole thing. `make up` generates `.env` with a random admin
-password, renders the Vector config, starts the four services, and applies the
-index templates, the retention policy and the Dashboards index patterns. It is
-idempotent — run it again any time.
+That is the whole thing. `make up` generates `.env` with a random admin password,
+renders the Vector config, starts the four services, and applies the index
+templates, the retention policy, the Dashboards index patterns and the dashboard
+this ships with. It is idempotent — run it again any time.
 
-Then open **http://<host>:5601** and log in as `admin` with the password in
-`.env`.
+Then open Dashboards and log in as `admin` with the password in `.env`:
 
-    make health          what is arriving, and from which hosts
-    make status          container and cluster state
-    make test-syslog     send a message and confirm it was stored
-    make logs            follow everything
-    make bootstrap       re-apply templates/retention/index patterns
+- **http://\<host\>:5601** on a fresh install, or
+- **http://\<host\>:5601/aldgate/** once `ALDGATE_BASEPATH=/aldgate` is set for
+  Provenance's proxy. With a base path set, the bare root answers **404** — which
+  looks like a broken Dashboards and is not.
+
+Nothing is sending yet. That is step 2.
 
 ## Enrol a host
 
@@ -226,6 +220,69 @@ accounts. Kept, deliberately:
 
 Result: 12,887 → 3,641 per four minutes, same 18 hosts, with errors and warnings
 untouched. Tune it with `aldgate_service_accounts` in the playbook.
+
+## Operating it
+
+    make health          what is arriving, and from which hosts
+    make status          container and cluster state
+    make logs            follow everything
+    make bootstrap       re-apply templates, retention, index patterns and the dashboard
+    make test-syslog     send a message and confirm it was stored
+    make test-snmp       send a trap (needs snmptrap on this box)
+    make enroll          print the one-liner that points a host's rsyslog here
+    make enroll-self     forward THIS collector's own logs into itself
+    make restart         restart every service
+    make down            stop; data is kept in the volumes
+    make clean           stop and DELETE every stored log
+
+**Upgrading** is `git pull && make up`. Nothing in `.env` is overwritten, the
+volumes are untouched, and `bootstrap` re-applies templates and re-imports the
+dashboard — so improvements to either arrive on upgrade. That is also why the
+shipped dashboard's description tells you to edit a copy: a re-import overwrites
+it.
+
+**Run `make enroll-self` once.** The collector is otherwise the only machine
+missing from its own index, which is precisely the one you want when the collector
+is the thing misbehaving.
+
+**Disk** is the thing to watch, and it is mostly decided by what you forward.
+Measured here: 384,000 messages a day at ~171 bytes each is **66 MB/day**, so about
+**2 GB** at the default 30-day retention. Before [the noise
+filtering](#what-is-not-forwarded) the same fleet sent 3.6 million messages and
+491 MB in a day — nine times as many, nearly all of it a control plane logging its
+own footsteps.
+
+`make health` shows what is arriving; for what it occupies:
+
+    set -a; . ./.env; set +a
+    curl -s -u "admin:$ALDGATE_ADMIN_PASSWORD" \
+      "localhost:9200/_cat/indices/syslog-*?v&h=index,docs.count,store.size"
+
+**Changing retention** is `ALDGATE_RETENTION_DAYS=90 make bootstrap`. It rewrites
+the ISM policy, and existing indices pick up the new window — no reindex.
+
+**There is no backup here, deliberately.** Logs are a rolling window that expires
+by design; the collector holds nothing that is not also on the hosts that sent it.
+What is worth keeping off-box is `.env`, because it holds the only copy of the
+admin and console passwords.
+
+## When something is missing
+
+Everything in this table looks like a broken collector from the outside, and none
+of it is. The [notes below](#notes-worth-keeping) say how each one was found.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Nothing at all is arriving | the host is not enrolled, or rsyslog is not running there | `make enroll` for the one-liner; `systemctl status rsyslog` on the host |
+| A host is in a 24-hour search but missing from the last hour | its syslog has no timezone, so it is filed hours in the past | the playbook forwards RFC5424; network gear needs `ALDGATE_TIMEZONE` — see [Timestamps](#timestamps) |
+| A host went quiet right after an rsyslog change | a config rsyslog refuses to parse. `systemctl is-active` still says **active** | `rsyslogd -N1` on the host. A `#` comment inside an expression breaks the whole config |
+| Traps arrive in tcpdump but never appear | a varbind named `ifIndex.2` collides in the mapping and the document is rejected 400 | already fixed; if it recurs, `docker logs aldgate-vector \| grep mapper_parsing` is the only place it shows |
+| A trap indexed with every field empty | `encoding: json` on Vector's http_server silently does nothing | it is `decoding.codec` |
+| The console opens but has no index patterns | saved objects went to a private tenant | `make bootstrap` writes them to the shared one |
+| The console asks for a username and password, inside Provenance | the `PROV_ALDGATE_CONSOLE_*` values have not reached Provenance | [provenance-integration.md](./docs/provenance-integration.md) |
+| A device shows up as an IP, or under a name nobody recognises | it announces its factory identity | `ALDGATE_DEVICE_MAP` — see [Naming devices](#naming-devices) |
+| The security API returns 403 for `admin` | `plugins.security.restapi.roles_enabled` was given a JSON array; `-E` passes it through as one literal string | comma-separated, no brackets |
+| `make up` fails with "Wrong Transport SSL configuration" | the demo config was disabled, so nothing generated the transport certificates | leave it on; see the note below |
 
 ## Notes worth keeping
 

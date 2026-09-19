@@ -76,11 +76,27 @@ test-snmp: ## Send a test SNMP trap (needs snmptrap on this box)
 	snmptrap -v 2c -c public $${ALDGATE_HOST:-localhost}:162 '' 1.3.6.1.6.3.1.1.5.3 2>/dev/null || true
 	@echo "  sent; check 'make health' for the snmp-* index"
 
-enroll: ## Print the one-liner that points a host's rsyslog here
-	@echo "  On the collector, run 'make enroll-playbook' for the Ansible version."
-	@echo "  Manually, on any Debian/Ubuntu host:"
-	@echo "    echo '*.* @@$${ALDGATE_HOST:-10.10.0.177}:514' | sudo tee /etc/rsyslog.d/60-aldgate.conf"
-	@echo "    sudo systemctl restart rsyslog"
+enroll: ## How to point a host's logs here (prefer the playbook)
+	@# This used to print a one-line `*.* @@host:514` and call it enrolment. It
+	@# named a `make enroll-playbook` target that does not exist, and the config it
+	@# printed produced RFC3164 -- no timezone -- so a host in a non-UTC zone landed
+	@# hours in the past and vanished from every search by time. It also had no disk
+	@# queue (a collector restart lost whatever was in flight) and no filtering, and
+	@# it wrote the SAME filename the playbook manages, so it would be silently
+	@# replaced on the next run. Three ways to look enrolled while not being.
+	@echo "  Preferred, and what the fleet uses:"
+	@echo "    ansible-playbook -i <inventory> ansible/enroll-syslog.yml -e aldgate_host=$${ALDGATE_HOST:-<collector>}"
+	@echo "  or paste that file into Provenance: Automation -> Playbooks -> Run."
+	@echo "  It installs rsyslog where a host has only journald, forwards RFC5424"
+	@echo "  (so timestamps carry an offset), queues to disk across a collector"
+	@echo "  outage, and drops the control plane's own session churn."
+	@echo
+	@echo "  Only if Ansible is not an option -- minimal, and NOT what the fleet runs:"
+	@echo "    printf '%s\\n%s\\n' '\$$ActionForwardDefaultTemplate RSYSLOG_SyslogProtocol23Format' \\"
+	@echo "      '*.* @@$${ALDGATE_HOST:-<collector>}:514' | sudo tee /etc/rsyslog.d/60-aldgate.conf"
+	@echo "    sudo rsyslogd -N1 && sudo systemctl restart rsyslog"
+	@echo "  The template line is not optional: without it this host reports times"
+	@echo "  with no timezone. Re-running the playbook later replaces this file."
 
 clean: ## Stop and DELETE all stored logs
 	@read -p "  This deletes every stored log. Type DELETE to continue: " c; [ "$$c" = DELETE ] || exit 1
