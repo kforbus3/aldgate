@@ -8,6 +8,26 @@ out to scrape.
                                                      ├──► OpenSearch ──► Dashboards
     SNMP traps (162/udp) ─────────────────► Telegraf ┘
 
+## Quick start
+
+Any Debian/Ubuntu machine with Docker. 4 GB RAM is enough for a small fleet; this
+one runs 4 vCPU / 8 GB and holds ~90 MB of logs a day from nineteen hosts.
+
+```bash
+git clone https://github.com/kforbus3/aldgate && cd aldgate
+make up                     # generates .env with a random admin password, starts everything,
+                            # applies index templates, retention and the shipped dashboard
+make health                 # what is arriving, per host
+```
+
+That is the collector running and listening. Nothing is sending to it yet — see
+[Enrol a host](#enrol-a-host), which is one playbook run per machine and two
+commands per network device.
+
+Then, to read the logs inside Provenance rather than here, see
+[docs/provenance-integration.md](./docs/provenance-integration.md): four values
+from this box's `.env` into Provenance's, and the Logs page starts working.
+
 | Component | Why this one |
 |---|---|
 | **OpenSearch 2.19** + Dashboards | Apache-2.0, full-text search, and Alerting and Security Analytics (SIEM rules) included rather than gated behind a licence tier. |
