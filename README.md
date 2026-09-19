@@ -179,6 +179,34 @@ Both timestamps are stored either way: `timestamp` is what the sender claimed,
 `received_at` is when it arrived. If they disagree, the sender's clock or
 timezone is wrong, and that is worth knowing rather than hiding.
 
+## What is not forwarded
+
+A control plane that probes every host every 30 seconds generates more log
+traffic than the fleet does. Measured here before any filtering: **12,887
+messages in four minutes**, of which over 90% was Provenance's own footsteps —
+each probe is an SSH login, a logind session, a per-user systemd instance
+starting and exiting, a sudo, and the whole thing torn down again. A log system
+whose own monitoring buries the logs is not a log system.
+
+The enrolment playbook therefore filters that churn **at the forwarding action
+only**. The host's `/var/log` keeps every line — 85,808 of them on one host at the
+time of writing — so nothing is destroyed and anything can be read back on the
+machine itself.
+
+Dropped: the per-user systemd instance's unit chatter (gpg-agent and ssh-agent
+sockets, `app.slice`, the user runtime directory), the per-session units keyed to
+the **service accounts' own UIDs**, and session open/close for the service
+accounts. Kept, deliberately:
+
+- every session for a **human** account, opened and closed
+- every authentication **failure**, from anyone, service accounts included
+- every `sudo`, including Provenance's — that records what actually ran as root
+- logind's `New session` / `Removed session`
+- anything at severity **warning or worse**, whatever it says
+
+Result: 12,887 → 3,641 per four minutes, same 18 hosts, with errors and warnings
+untouched. Tune it with `aldgate_service_accounts` in the playbook.
+
 ## Notes worth keeping
 
 **A dotted key can reject a whole document.** Real traps name their variables

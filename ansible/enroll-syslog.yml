@@ -23,6 +23,10 @@
   gather_facts: true
   vars:
     aldgate_host: "10.10.0.177"
+    # The accounts Provenance itself logs in as. Their session churn is filtered
+    # out of what gets FORWARDED (never out of the host's own logs) -- see the
+    # forwarding rule below for why and for exactly what survives.
+    aldgate_service_accounts: [prov, prov-login, fleet, fleet-login]
     aldgate_port: 514
     # TCP by default. UDP loses messages silently under load and gives no
     # back-pressure, which is the wrong trade for an audit trail; @@ is TCP in
@@ -62,6 +66,18 @@
         state: present
       notify: Restart journald
 
+    - name: Look up the service accounts' UIDs
+      # systemd names its per-session units by UID -- user@1003.service,
+      # run-user-1003.mount, user-1003.slice -- with no account name anywhere in
+      # the message. Filtering those by text alone would drop a HUMAN's session
+      # scaffolding too, so the numbers are looked up here, per host, because the
+      # same account has different UIDs on different machines.
+      ansible.builtin.shell: |
+        for a in {{ aldgate_service_accounts | join(' ') }}; do id -u "$a" 2>/dev/null || true; done
+      register: aldgate_service_uids
+      changed_when: false
+      check_mode: false
+
     - name: Install the forwarding rule
       ansible.builtin.copy:
         dest: /etc/rsyslog.d/60-aldgate.conf
@@ -82,14 +98,115 @@
           # UTC files a host in EDT four hours in the past -- every search by
           # time then misses that host, and a "last hour" view looks like the
           # host has stopped sending. RFC5424 carries an explicit offset.
-          $ActionForwardDefaultTemplate RSYSLOG_SyslogProtocol23Format
           $WorkDirectory /var/spool/rsyslog
-          $ActionQueueType LinkedList
-          $ActionQueueFileName aldgate
-          $ActionQueueMaxDiskSpace 256m
-          $ActionQueueSaveOnShutdown on
-          $ActionResumeRetryCount -1
-          *.* {{ aldgate_protocol }}{{ aldgate_host }}:{{ aldgate_port }}
+
+          # --- what NOT to send ------------------------------------------------
+          #
+          # Provenance probes every host every 30 seconds, and each probe is an SSH
+          # login: a logind session, a per-user systemd instance starting and
+          # exiting, a sudo, and the whole thing torn down again. Measured on this
+          # fleet, that was over 90% of everything the collector received --
+          # 21,748 `systemd` lines in ten minutes against ~1,500 for every real
+          # event on every host combined. A log system whose own monitoring buries
+          # the logs is not a log system.
+          #
+          # Filtered HERE, at the forward action only: the host's own
+          # /var/log keeps every line, so nothing is destroyed and anything can be
+          # read back on the machine itself.
+          #
+          # What is dropped is scaffolding, not evidence:
+          #  * the per-user systemd instance's own unit chatter -- gpg-agent and
+          #    ssh-agent sockets opening and closing, app.slice being created,
+          #    exit.target, the user runtime directory. None of it says who did
+          #    anything; it is the same lines whoever logs in.
+          #  * session open/close for the SERVICE accounts only.
+          #
+          # What survives, deliberately:
+          #  * every session for a HUMAN account, opened and closed
+          #  * every authentication FAILURE, from anyone, including the service
+          #    accounts -- a failing probe is exactly what you want to see
+          #  * every sudo, including Provenance's: that records what was actually
+          #    run as root, which is the part worth keeping
+          #  * logind's New session / Removed session, which is the cleanest
+          #    per-session record there is
+          set $.aldgate_noise = 0;
+
+          if ($programname startswith "systemd" or $programname == "(systemd)") and not ($syslogseverity <= 4) then {
+            # Matched on the UNIT NAMES that only exist inside a user session,
+            # rather than on verbs like "Stopped target". A system shutdown also
+            # stops targets, and those lines are worth keeping; `sockets.target`
+            # for a per-login user manager is not. fleet-wg-reresolve is
+            # Provenance's own WireGuard re-resolver, which runs on a timer and says
+            # the same three lines every time; a FAILURE of it is severity <= 4 and
+            # still arrives.
+            #
+            # NOTE: no comments inside the expression below. rsyslog rejects `#`
+            # within an expression -- "invalid character '#' in expression" -- and
+            # then cannot interpret the master config at all, so the host silently
+            # stops forwarding AND stops writing /var/log/syslog. That is what
+            # happened when this list was extended without re-running
+            # `rsyslogd -N1`: seventeen hosts went quiet at once.
+            if ($msg contains "gpg-agent" or $msg contains "ssh-agent.socket"
+                or $msg contains "keyboxd.socket" or $msg contains "dirmngr.socket"
+                or $msg contains "dbus.socket"
+                or $msg contains "app.slice" or $msg contains "exit.target"
+                or $msg contains "systemd-exit.service"
+                or $msg contains "basic.target" or $msg contains "default.target"
+                or $msg contains "paths.target" or $msg contains "sockets.target"
+                or $msg contains "timers.target" or $msg contains "shutdown.target"
+                or $msg contains "User Runtime Directory"
+                or $msg contains "User Manager for UID" or $msg contains "Queued start job"
+                or $msg contains "fleet-wg-reresolve") then
+              set $.aldgate_noise = 1;
+          }
+
+          # Session open/close for the service accounts. Keyed on the account name
+          # AND on it being a session message, so "authentication failure for prov"
+          # is never matched.
+          {% for acct in aldgate_service_accounts %}
+          if ($programname startswith "sshd" or $programname == "su"
+              or $programname == "systemd-logind" or $programname == "(systemd)"
+              or $programname == "(sd-pam)")
+             and not ($syslogseverity <= 4)
+             and ($msg contains "session closed for user {{ acct }}"
+                  or $msg contains "session opened for user {{ acct }}("
+                  or $msg contains "Close session: user {{ acct }} ") then
+            set $.aldgate_noise = 1;
+          {% endfor %}
+
+          # The per-session units the SYSTEM manager logs about, keyed on the
+          # service accounts' own UIDs so a human's session is left alone.
+          {% for uid in aldgate_service_uids.stdout_lines | map('trim') | select | list %}
+          if ($programname == "systemd") and not ($syslogseverity <= 4)
+             and ($msg contains "user@{{ uid }}.service"
+                  or $msg contains "user-{{ uid }}.slice"
+                  or $msg contains "run-user-{{ uid }}.mount"
+                  or $msg contains "user-runtime-dir@{{ uid }}.service") then
+            set $.aldgate_noise = 1;
+          {% endfor %}
+
+          # sshd's byte counter, which carries no information about who did what.
+          # Outside the account loop because it names nobody to key on.
+          if ($programname startswith "sshd") and ($msg startswith "Transferred: sent ") then
+            set $.aldgate_noise = 1;
+
+          if $.aldgate_noise == 0 then {
+            action(type="omfwd"
+                   target="{{ aldgate_host }}" port="{{ aldgate_port }}"
+                   protocol="{{ 'tcp' if aldgate_protocol == '@@' else 'udp' }}"
+                   # RFC5424, not the default RFC3164: RFC3164 carries no timezone,
+                   # so a collector in UTC files an EDT host four hours in the past
+                   # and it vanishes from every search by time.
+                   template="RSYSLOG_SyslogProtocol23Format"
+                   # A disk-assisted queue, so a collector outage or a reboot of it
+                   # does not lose this host's logs: rsyslog spools and drains when
+                   # Aldgate comes back.
+                   queue.type="LinkedList"
+                   queue.filename="aldgate"
+                   queue.maxdiskspace="256m"
+                   queue.saveonshutdown="on"
+                   action.resumeRetryCount="-1")
+          }
       notify: Restart rsyslog
 
     - name: Ensure the spool directory exists
