@@ -51,7 +51,11 @@ services:
       # Demo users other than admin (kibanaserver and friends) ship with known
       # passwords. bootstrap.sh removes the ones nothing uses; the one Dashboards
       # needs is reachable only from this network.
-      - plugins.security.restapi.roles_enabled=["all_access","security_rest_api_access"]
+      # Comma-separated, NOT a JSON array. `-E` passes the bracketed form through
+      # as one literal string, which matches no role, and the security REST API
+      # then refuses every request with "does not have any role privileged for
+      # admin access" -- while the setting looks perfectly correct in the file.
+      - plugins.security.restapi.roles_enabled=all_access,security_rest_api_access
     ulimits:
       memlock: { soft: -1, hard: -1 }
       nofile:  { soft: 65536, hard: 65536 }

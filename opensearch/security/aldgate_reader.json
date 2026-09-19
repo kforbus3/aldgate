@@ -1,0 +1,35 @@
+{
+  "cluster_permissions": [
+    "cluster_composite_ops_ro",
+    "cluster:monitor/health",
+    "cluster:monitor/state",
+    "cluster:monitor/nodes/info"
+  ],
+  "index_permissions": [
+    {
+      "index_patterns": [
+        "syslog-*",
+        "snmp-*"
+      ],
+      "allowed_actions": [
+        "read",
+        "search",
+        "indices:monitor/settings/get",
+        "indices:admin/mappings/get",
+        "indices:admin/get",
+        "indices:admin/resolve/index"
+      ]
+    }
+  ],
+  "tenant_permissions": [
+    {
+      "tenant_patterns": [
+        "global_tenant"
+      ],
+      "allowed_actions": [
+        "kibana_all_read"
+      ]
+    }
+  ],
+  "description": "The read-only console tier. Scoped to the two log index patterns and nothing else, so a viewer cannot read .kibana internals, the security index, or any index added later for another purpose. Paired with kibana_read_only, which is what puts the Dashboards UI itself in read-only mode."
+}
