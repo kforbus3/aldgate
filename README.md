@@ -207,6 +207,21 @@ only**. The host's `/var/log` keeps every line — 85,808 of them on one host at
 time of writing — so nothing is destroyed and anything can be read back on the
 machine itself.
 
+### Noise the hosts themselves make
+
+Some noise is worth removing at the source rather than filtering, because the host
+is reporting a non-problem and the fix is a one-line config:
+
+| playbook | what it silences | why it is noise |
+|---|---|---|
+| `ansible/quiet-ntp-veth.yml` | two `ntpd` errors per container start on every Docker host | each container gets a veth with an IPv6 link-local address; ntpd tries to bind it and it is usually gone by then. Nothing is wrong with the clock. On one build host this was the fleet's largest single source of error-severity logs |
+
+`quiet-ntp-veth.yml` works the interfaces out from the host's own facts, refuses to
+write an allowlist that contains no real interface, and **proves a time server still
+answers afterwards** — restoring the old config and failing if one does not. A
+restarted service is not evidence that it still works, and a silent ntpd that can no
+longer reach a server surfaces weeks later as clock drift.
+
 Dropped: the per-user systemd instance's unit chatter (gpg-agent and ssh-agent
 sockets, `app.slice`, the user runtime directory), the per-session units keyed to
 the **service accounts' own UIDs**, and session open/close for the service

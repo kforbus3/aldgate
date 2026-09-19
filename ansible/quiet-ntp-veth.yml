@@ -1,0 +1,140 @@
+---
+# Stop ntpd logging an error for every container that starts.
+#
+# A Docker host logs two error lines every time a container starts:
+#
+#   IO: bind(39) AF_INET6 fe80::d8bd:fff:fea1:6234%293#123 flags 0x1 failed: Cannot
+#       assign requested address
+#   IO: unable to create socket on vethea3b2db (232) for fe80::...
+#
+# Each container gets a veth pair with an IPv6 link-local address. ntpd notices the
+# new interface, tries to open a socket on it, and the address is frequently gone by
+# the time it gets there. Nothing is wrong with the clock, and nothing is wrong with
+# the container: the daemon is reporting that it could not bind to something it
+# should never have tried to bind to. On a build host it was the single largest
+# source of error-severity logs in the fleet.
+#
+# The fix is an allowlist: ignore every interface, then name the real ones. This
+# playbook works out which those are from the host's own facts.
+#
+#   ansible-playbook -i <inventory> ansible/quiet-ntp-veth.yml
+#
+# Idempotent: the block is marked, and re-running replaces it only if it changed.
+#
+# It ASSERTS that time sync still works afterwards, and puts the old config back if
+# it does not. An allowlist that is wrong does not fail loudly -- ntpd starts, says
+# nothing, and stops being able to reach a time server, which surfaces weeks later as
+# clock drift. "The service restarted" is not evidence that it still works.
+- name: Stop ntpd logging a bind error for every container veth
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Interfaces that are not a machine's real network: container plumbing, the
+    # overlay, tunnels, and loopback.
+    ntp_ignore_prefixes: ["veth", "docker", "br-", "virbr", "wg", "tun", "tap", "lo", "cni", "flannel", "kube"]
+
+  tasks:
+    - name: Find the ntp daemon's config
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/ntpsec/ntp.conf
+        - /etc/ntp.conf
+      register: ntp_conf_candidates
+
+    - name: Note which config exists
+      ansible.builtin.set_fact:
+        ntp_conf: "{{ (ntp_conf_candidates.results | selectattr('stat.exists') | map(attribute='stat.path') | list | first) | default('') }}"
+
+    # A host running chrony or systemd-timesyncd does not have this problem at all:
+    # neither opens a socket per interface. Skipping is the right answer, and saying
+    # so is better than reporting "ok" on a host that was never affected.
+    - name: Skip hosts that do not run ntpd
+      ansible.builtin.meta: end_host
+      when: ntp_conf == ''
+
+    - name: Which interfaces are real
+      ansible.builtin.set_fact:
+        ntp_listen_interfaces: >-
+          {{ ansible_facts.interfaces
+             | reject('match', '^(' ~ (ntp_ignore_prefixes | join('|')) ~ ')')
+             | list | sort }}
+
+    # An empty list would produce a config that listens on loopback only: ntpd would
+    # start, report nothing, and never reach a time server again. Refuse instead.
+    - name: Refuse to write an allowlist with no real interface in it
+      ansible.builtin.assert:
+        that: ntp_listen_interfaces | length > 0
+        fail_msg: >-
+          No non-container interface was found on this host, so an allowlist would
+          leave ntpd with loopback only and no way to reach a time server. Nothing
+          was changed.
+
+    - name: Back up the config once, before the first change
+      ansible.builtin.copy:
+        src: "{{ ntp_conf }}"
+        dest: "{{ ntp_conf }}.bak-preiface"
+        remote_src: true
+        force: false
+        mode: preserve
+
+    - name: Restrict ntpd to the real interfaces
+      ansible.builtin.blockinfile:
+        path: "{{ ntp_conf }}"
+        marker: "# {mark} ANSIBLE MANAGED: ntpd interface allowlist (aldgate)"
+        block: |
+          # Every container start creates a veth with an IPv6 link-local address that
+          # is often gone before ntpd can bind it. Ignore everything, then name the
+          # interfaces this host actually has.
+          interface ignore all
+          interface listen 127.0.0.1
+          interface listen ::1
+          {% for i in ntp_listen_interfaces %}
+          interface listen {{ i }}
+          {% endfor %}
+      register: ntp_block
+
+    - name: Restart and prove it still keeps time
+      when: ntp_block.changed
+      block:
+        - name: Restart the ntp daemon
+          ansible.builtin.service:
+            name: "{{ 'ntpsec' if 'ntpsec' in ntp_conf else 'ntp' }}"
+            state: restarted
+
+        # iburst means a reachable server usually answers within a few seconds; this
+        # retries rather than sleeping a fixed time, so a slow one is not a failure.
+        - name: Wait until at least one time server has answered
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              ntpq -pn 2>/dev/null | awk 'NR>2 && $1 !~ /POOL/ && $7 != "0" {found=1} END {exit found?0:1}'
+            executable: /bin/bash
+          changed_when: false
+          register: ntp_reach
+          retries: 10
+          delay: 6
+          until: ntp_reach.rc == 0
+
+      rescue:
+        - name: Put the old config back, because the new one cannot keep time
+          ansible.builtin.copy:
+            src: "{{ ntp_conf }}.bak-preiface"
+            dest: "{{ ntp_conf }}"
+            remote_src: true
+            mode: preserve
+
+        - name: Restart with the restored config
+          ansible.builtin.service:
+            name: "{{ 'ntpsec' if 'ntpsec' in ntp_conf else 'ntp' }}"
+            state: restarted
+
+        - name: Report what happened and why nothing was left changed
+          ansible.builtin.fail:
+            msg: >-
+              The interface allowlist was written and no time server answered within
+              a minute, so the previous config has been restored and ntpd restarted
+              with it. Interfaces offered were:
+              {{ ntp_listen_interfaces | join(', ') }}. This host is unchanged.
