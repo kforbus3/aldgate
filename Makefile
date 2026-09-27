@@ -27,6 +27,9 @@ enroll-self: ## Forward this collector's OWN logs into itself
 	@# this wrote "orkDirectory" and the target died on its own output.
 	@sudo install -d -m 0700 /var/spool/rsyslog
 	@sudo install -m 0644 rsyslog/60-aldgate-self.conf /etc/rsyslog.d/60-aldgate-self.conf
+	@# imklog drops userspace lines written to /dev/kmsg (systemd, generators,
+	@# early boot) unless told otherwise -- same setting enroll-syslog.yml applies.
+	@sudo sed -i 's/^module(load="imklog")/module(load="imklog" PermitNonKernelFacility="on")/' /etc/rsyslog.conf
 	@sudo rsyslogd -N1 >/dev/null 2>&1 || { echo "  rsyslog REJECTED the config; reverting"; sudo rm -f /etc/rsyslog.d/60-aldgate-self.conf; exit 1; }
 	@sudo systemctl restart rsyslog
 	@echo "  this collector now forwards its own logs to itself"
