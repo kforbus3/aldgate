@@ -71,6 +71,20 @@
         state: present
       notify: Restart journald
 
+    - name: Let imklog forward userspace messages from the kernel log
+      # systemd, its generators and early-boot services write to /dev/kmsg, not
+      # the journal socket, so they reach rsyslog only through imklog -- which
+      # DISCARDS every message whose facility is not "kernel" unless told
+      # otherwise. The journal keeps them (and anything reading the journal
+      # directly sees them), so the loss is invisible from the host. Measured on
+      # vhost: 112 such messages in one boot never arrived, among them warnings
+      # like "SysV service ... lacks a native systemd unit file".
+      ansible.builtin.replace:
+        path: /etc/rsyslog.conf
+        regexp: '^module\(load="imklog"\)'
+        replace: 'module(load="imklog" PermitNonKernelFacility="on")'
+      notify: Restart rsyslog
+
     - name: Look up the service accounts' UIDs
       # systemd names its per-session units by UID -- user@1003.service,
       # run-user-1003.mount, user-1003.slice -- with no account name anywhere in
@@ -200,6 +214,12 @@
               or $programname == "systemd-xdg-autostart-generator"
               or $programname == "at-spi-bus-launcher") then
             set $.aldgate_noise = 1;
+          # Every new session's user systemd logs this through the kernel log,
+          # so rsyslog sees it as program "kernel" (imklog, above). Session
+          # churn; the kernel's own module loads have a different text.
+          if not ($syslogseverity <= 4) and ($programname == "kernel" or $programname == "systemd")
+             and ($msg contains "Inserted module 'autofs4'") then
+            set $.aldgate_noise = 1;
 
           # systemd's bookkeeping for per-session units -- sockets, slices and
           # scopes opening and closing. One line per unit per login, and on a host
@@ -327,8 +347,18 @@
         name: systemd-journald
         state: restarted
 
-    - name: Restart rsyslog
+    # Validate BEFORE restarting: rsyslog restarts "successfully" on a config it
+    # cannot parse and then forwards nothing, while `systemctl is-active` still
+    # says active. Handlers run in the order they are defined, so a failed
+    # validation stops the play before the restart.
+    - name: Validate rsyslog config
+      ansible.builtin.command: rsyslogd -N1
+      changed_when: false
+      listen: Restart rsyslog
+
+    - name: Restart rsyslog after validation
       ansible.builtin.service:
         name: rsyslog
         state: restarted
         enabled: true
+      listen: Restart rsyslog

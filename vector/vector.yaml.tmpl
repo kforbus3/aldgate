@@ -288,6 +288,20 @@ transforms:
       if m == null { m = "" }
       .message = to_string(m) ?? ""
 
+      # --- userspace messages that came through the kernel log ------------
+      # systemd, its generators and early-boot services write to /dev/kmsg;
+      # rsyslog's imklog forwards them tagged "kernel" with the real sender
+      # inside the text ("systemd-sysv-generator[945]: ..."). A facility other
+      # than kern is what gives them away -- the kernel's own lines keep theirs.
+      if .program == "kernel" && .facility != "kern" {
+        km, err = parse_regex(.message, r'^(?P<prog>[A-Za-z0-9_.@()/+-]+)\[(?P<pid>\d+)\]: (?P<msg>.*)$')
+        if err == null {
+          .program = km.prog
+          .pid = km.pid
+          .message = km.msg
+        }
+      }
+
       # --- time -----------------------------------------------------------
       # Both, because devices with a wrong clock are common: `timestamp` is what
       # the sender claimed, `received_at` is when it actually arrived here.
